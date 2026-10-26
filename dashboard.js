@@ -283,6 +283,8 @@ function renderCharts() {
   rebuildRankings();
   hydrateArtistExplorer();
   renderArtistChart();
+  renderRace();
+  renderArtistWeb();
 }
 
 let qArtists='', qAlbums='', qTracks='';
@@ -564,6 +566,8 @@ function bootstrap(){
 
   renderKpis({ fromDay: state.fromDay, toDay: state.toDay });
   wireInteractions();
+  wireRaceControls();
+  wireWebControls();
   document.getElementById('artist-input').addEventListener('change', renderArtistChart);
   document.getElementById('artist-input').addEventListener('keyup', renderArtistChart);
 
@@ -752,6 +756,813 @@ function wireInteractions(){
       rebuildRankings();
     });
   }
+}
+
+const prefersReducedMotion = () =>
+  window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+/* ---------- Animated top-artists line race (canvas) ----------
+ * One line per artist, value = minutes in a trailing window (or all time). A
+ * window of the last `win` days scrolls past as time advances, only each day's
+ * top RACE_TOP artists are drawn, and the y-scale/gridlines ease with the data. */
+
+const RACE_TOP = 10;
+const RACE_LEAD_DAYS = 3; // empty days kept before the first listen when auto-trimming the start
+const RACE_TOP_MAX = 15; // most lines shown when filtering to chosen artists
+// Candidates considered per kind (top by total minutes); tracks need a deeper pool
+// because a track can top a 30-day window without ranking high all-time.
+const RACE_POOL = { artists: 400, albums: 700, tracks: 1500 };
+const RACE_KIND_LABEL = { artists: "artists", albums: "albums", tracks: "tracks" };
+
+const race = {
+  data: null,
+  t: 0, // current position, in days since the start of the filtered range
+  playing: false,
+  raf: 0,
+  last: 0,
+  speed: 60, // days per second
+  kind: "artists", // what is ranked: artists | albums | tracks
+  trail: 30, // trailing-window length in days; 0 = all time (cumulative)
+  filter: { mode: "only", names: new Set() }, // artist filter ("only" these / "hide" these)
+  win: 84, // days visible on the x-axis
+  pending: false,
+  scrubbing: false, // user is dragging the slider
+  observer: null,
+  ctx: null,
+  w: 0,
+  h: 0,
+};
+
+/** Cosine-weighted average of `a` around fractional index `index` (eases scale changes). */
+function raceAvg(a, index, width) {
+  index = Math.min(a.length - 1, Math.max(0, index));
+  const s = Math.max(0, Math.ceil(index - width));
+  const e = Math.min(Math.floor(index + width), a.length - 1);
+  let num = 0,
+    den = 0;
+  for (let d = s; d <= e; d++) {
+    const wt = 0.5 + 0.5 * Math.cos(((d - index) / width) * Math.PI);
+    num += a[d] * wt;
+    den += wt;
+  }
+  return den ? num / den : a[Math.round(index)] || 0;
+}
+
+function raceUnit(i) {
+  return [1, 2, 5][((i % 3) + 3) % 3] * Math.pow(10, Math.floor(i / 3));
+}
+
+const raceEntityCache = {};
+/** Rankable things of one kind, normalised to {id, label, artist, image, days}. */
+function raceEntities(kind) {
+  if (raceEntityCache[kind]) return raceEntityCache[kind];
+  const artistImg = new Map(DATA.artists.map((a) => [a.name, a.image]));
+  let list;
+  if (kind === "tracks") {
+    list = DATA.tracks.map((t) => ({ id: t.key, label: t.title, artist: t.artist, image: t.image || artistImg.get(t.artist), days: t.days }));
+  } else if (kind === "albums") {
+    list = DATA.albums.map((al) => ({ id: al.key, label: al.album, artist: al.artist, image: al.image || artistImg.get(al.artist), days: al.days }));
+  } else {
+    list = DATA.artists.map((a) => ({ id: a.name, label: a.name, artist: a.name, image: a.image, days: a.days }));
+  }
+  return (raceEntityCache[kind] = list);
+}
+
+/** Entities feeding the race, after applying the artist filter. */
+function raceSource() {
+  const { mode, names } = race.filter;
+  const all = raceEntities(race.kind);
+  const cap = RACE_POOL[race.kind];
+  if (!names.size) return all.slice(0, cap);
+  if (mode === "only") return all.filter((e) => names.has(e.artist)).slice(0, cap * 2);
+  return all.filter((e) => !names.has(e.artist)).slice(0, cap);
+}
+
+function buildRaceData() {
+  const lo = dayStrToOff(state.fromDay),
+    hi = dayStrToOff(state.toDay);
+  const N = hi - lo + 1;
+  if (!(N >= 2)) return null;
+  const trail = race.trail;
+  const pad = trail ? trail - 1 : 0;
+  const { mode, names } = race.filter;
+  const top = race.kind === "artists" && mode === "only" && names.size ? Math.min(names.size, RACE_TOP_MAX) : RACE_TOP;
+
+  const pool = [];
+  for (const e of raceSource()) {
+    const dense = new Float64Array(N + pad); // index 0 = day (lo - pad)
+    let any = false;
+    for (const [i, ms] of e.days) {
+      const j = i - (lo - pad);
+      if (j >= 0 && j < dense.length) {
+        dense[j] += ms;
+        any = true;
+      }
+    }
+    if (!any) continue;
+    const v = new Float32Array(N);
+    let run = 0;
+    if (trail) {
+      for (let j = 0; j < pad; j++) run += dense[j];
+      for (let k = 0; k < N; k++) {
+        run += dense[k + pad];
+        v[k] = run / 60000;
+        run -= dense[k];
+      }
+    } else {
+      for (let k = 0; k < N; k++) {
+        run += dense[k];
+        v[k] = run / 60000;
+      }
+    }
+    pool.push({ name: e.label, image: e.image, v, shown: new Uint8Array(N) });
+  }
+
+  const maxes = new Float32Array(N);
+  for (let k = 0; k < N; k++) {
+    const best = []; // pool indices, descending by value on day k
+    for (let p = 0; p < pool.length; p++) {
+      const val = pool[p].v[k];
+      if (val <= 0) continue;
+      if (best.length >= top && val <= pool[best[best.length - 1]].v[k]) continue;
+      let pos = best.length;
+      while (pos > 0 && pool[best[pos - 1]].v[k] < val) pos--;
+      best.splice(pos, 0, p);
+      if (best.length > top) best.pop();
+    }
+    for (const p of best) pool[p].shown[k] = 1;
+    maxes[k] = best.length ? pool[best[0]].v[k] : 0;
+  }
+
+  const artists = pool.filter((a) => a.shown.includes(1));
+  artists.forEach((a, i) => (a.color = `hsl(${(i * 137.508) % 360} 85% 63%)`));
+  // Start just before the first visible listen instead of at the beginning of the range.
+  let first = N - 1;
+  for (const a of artists) {
+    const i = a.shown.indexOf(1);
+    if (i >= 0 && i < first) first = i;
+  }
+  const start = Math.max(0, first - RACE_LEAD_DAYS);
+  return { N, lo, start, artists, maxes, top, trail, kind: race.kind, scales: null, scalesWin: 0 };
+}
+
+const raceImgs = new Map();
+/** Loaded image for a url, or null (starts loading it and repaints once ready if paused). */
+function raceImg(url) {
+  if (!url) return null;
+  let im = raceImgs.get(url);
+  if (!im) {
+    im = new Image();
+    im.onload = () => {
+      im.ok = true;
+      if (!race.playing) drawRace();
+    };
+    im.src = url;
+    raceImgs.set(url, im);
+  }
+  return im.ok ? im : null;
+}
+
+/** Per-day y-axis maximum: the largest value seen in the visible window, smoothed. */
+function raceScales(data, win) {
+  if (data.scales && data.scalesWin === win) return data.scales;
+  const { N, maxes } = data;
+  const windowed = new Float32Array(N);
+  for (let k = 0; k < N; k++) {
+    let m = 0;
+    for (let j = Math.max(0, k - win); j <= k; j++) if (maxes[j] > m) m = maxes[j];
+    windowed[k] = m;
+  }
+  const margin = Math.max(3, Math.round(win / 8));
+  const out = new Float32Array(N);
+  // Eased headroom, but never below the true peak in view (smoothing alone clips spikes).
+  for (let k = 0; k < N; k++) out[k] = Math.max(1, raceAvg(windowed, k, margin) * 1.2, windowed[k] * 1.08);
+  data.scales = out;
+  data.scalesWin = win;
+  return out;
+}
+
+function raceResize() {
+  const canvas = document.getElementById("c-race");
+  const host = canvas.parentElement;
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  race.w = host.clientWidth;
+  race.h = host.clientHeight;
+  canvas.width = Math.round(race.w * dpr);
+  canvas.height = Math.round(race.h * dpr);
+  race.ctx = canvas.getContext("2d");
+  race.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+
+function drawRace() {
+  const ctx = race.ctx;
+  const data = race.data;
+  if (!ctx) return;
+  const { w, h } = race;
+  ctx.clearRect(0, 0, w, h);
+  ctx.fillStyle = "#12061f";
+  ctx.fillRect(0, 0, w, h);
+  if (!data) {
+    ctx.fillStyle = "#c9b8e0";
+    ctx.font = "14px Inter, system-ui, sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillText("Pick a date range of at least two days.", w / 2, h / 2);
+    return;
+  }
+
+  const { N, lo, artists } = data;
+  const win = race.win || Math.max(1, N - data.start), // 0 = whole range
+    interval = win / 4;
+  const t = Math.min(Math.max(race.t, data.start), N - 1);
+  const d = Math.floor(t),
+    frac = t - d;
+  const fs = Math.max(11, Math.min(16, w / 62));
+  const x0 = Math.min(64, w * 0.09),
+    x1 = w - Math.min(260, w * 0.28);
+  const yTop = Math.max(70, h * 0.17),
+    yBot = h - 34;
+  const pw = x1 - x0,
+    ph = yBot - yTop;
+
+  const scales = raceScales(data, win);
+  const scale = Math.max(1, scales[d] + (scales[Math.min(d + 1, N - 1)] - scales[d]) * frac);
+  const xOf = (i) => x1 - ((t - i) / win) * pw;
+  const yOf = (val) => yBot - (val / scale) * ph;
+  const valAt = (a, i) => a.v[i];
+
+  // Horizontal unit lines, cross-fading between neighbouring 1-2-5 units.
+  const f = 3 * Math.log10(scale / 4);
+  const i0 = Math.floor(f),
+    r = f - i0;
+  const compact = new Intl.NumberFormat(undefined, { notation: "compact", maximumFractionDigits: 1 });
+  ctx.font = `${fs - 1}px Inter, system-ui, sans-serif`;
+  ctx.textBaseline = "middle";
+  const unitLines = (u, alpha) => {
+    if (alpha < 0.01) return;
+    ctx.globalAlpha = alpha;
+    for (let val = 0; val <= scale; val += u) {
+      const y = yOf(val);
+      ctx.strokeStyle = "rgba(201,184,224,0.22)";
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(x0, y);
+      ctx.lineTo(x1 + 8, y);
+      ctx.stroke();
+      ctx.fillStyle = "#c9b8e0";
+      ctx.textAlign = "right";
+      ctx.fillText(compact.format(val), x0 - 10, y);
+    }
+    ctx.globalAlpha = 1;
+  };
+  unitLines(raceUnit(i0), 1 - r);
+  unitLines(raceUnit(i0 + 1), r);
+
+  // Vertical date lines that scroll with the data.
+  ctx.textBaseline = "alphabetic";
+  ctx.textAlign = "center";
+  const shortDate = (off) => {
+    const iso = offToDayStr(off);
+    return `${iso.slice(5, 7)}/${iso.slice(8, 10)}/${iso.slice(2, 4)}`;
+  };
+  for (let j = Math.ceil(t - win); j <= Math.floor(t); j++) {
+    if (j < 0 || (lo + j) % Math.round(interval) !== 0) continue;
+    const x = xOf(j);
+    if (x < x0 + 2) continue;
+    ctx.strokeStyle = "rgba(201,184,224,0.16)";
+    ctx.beginPath();
+    ctx.moveTo(x, yTop);
+    ctx.lineTo(x, yBot);
+    ctx.stroke();
+    ctx.fillStyle = "#c9b8e0";
+    ctx.fillText(shortDate(lo + j), x, yBot + fs + 6);
+  }
+
+  // Lines (clipped on the left so they slide under the y-axis).
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(x0, yTop - 6, w - x0, ph + 12);
+  ctx.clip();
+  ctx.lineWidth = 2.6;
+  ctx.lineJoin = "round";
+  const labels = [];
+  const iStart = Math.max(0, Math.floor(t - win) - 1);
+  for (const a of artists) {
+    ctx.strokeStyle = a.color;
+    let open = false;
+    ctx.beginPath();
+    for (let i = iStart; i <= d; i++) {
+      if (!a.shown[i]) {
+        if (open) {
+          ctx.lineTo(xOf(i), yOf(valAt(a, i)));
+          open = false;
+        }
+        continue;
+      }
+      const x = xOf(i),
+        y = yOf(valAt(a, i));
+      if (open) ctx.lineTo(x, y);
+      else ctx.moveTo(x, y);
+      open = true;
+    }
+    if (open && a.shown[d]) {
+      const next = d + 1 < N ? valAt(a, d + 1) : valAt(a, d);
+      const cur = valAt(a, d) + (next - valAt(a, d)) * frac;
+      ctx.lineTo(x1, yOf(cur));
+      labels.push({ a, y: yOf(cur), val: cur });
+    }
+    ctx.stroke();
+  }
+  ctx.restore();
+
+  // End-of-line icons and name labels (nudged apart so they stay readable).
+  const R = Math.max(10, fs * 0.85);
+  labels.sort((p, q) => p.y - q.y);
+  const gap = Math.max(fs + 3, 2 * R + 2);
+  let prev = -Infinity;
+  for (const L of labels) {
+    L.ly = Math.max(L.y, prev + gap);
+    prev = L.ly;
+  }
+  for (let i = labels.length - 2; i >= 0; i--) {
+    if (labels[i + 1].ly > yBot + 6) labels[i + 1].ly = yBot + 6;
+    labels[i].ly = Math.min(labels[i].ly, labels[i + 1].ly - gap);
+  }
+  ctx.textAlign = "left";
+  ctx.textBaseline = "middle";
+  ctx.font = `600 ${fs}px Inter, system-ui, sans-serif`;
+  const maxLabelW = w - x1 - 2 * R - 20;
+  for (const L of labels) {
+    const cy = L.ly,
+      cx = x1 + R;
+    if (Math.abs(cy - L.y) > 1) {
+      ctx.strokeStyle = L.a.color;
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(x1, L.y);
+      ctx.lineTo(cx, cy);
+      ctx.stroke();
+    }
+    const im = raceImg(L.a.image);
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(cx, cy, R, 0, Math.PI * 2);
+    ctx.clip();
+    if (im) {
+      const side = Math.min(im.naturalWidth, im.naturalHeight);
+      ctx.drawImage(im, (im.naturalWidth - side) / 2, (im.naturalHeight - side) / 2, side, side, cx - R, cy - R, 2 * R, 2 * R);
+    } else {
+      ctx.fillStyle = L.a.color;
+      ctx.fillRect(cx - R, cy - R, 2 * R, 2 * R);
+      ctx.fillStyle = "#12061f";
+      ctx.textAlign = "center";
+      ctx.fillText((L.a.name.trim()[0] || "?").toUpperCase(), cx, cy + 1);
+      ctx.textAlign = "left";
+    }
+    ctx.restore();
+    ctx.strokeStyle = L.a.color;
+    ctx.lineWidth = 2.5;
+    ctx.beginPath();
+    ctx.arc(cx, cy, R, 0, Math.PI * 2);
+    ctx.stroke();
+
+    ctx.fillStyle = L.a.color;
+    const val = `  ${fmtNum(L.val)}`;
+    let name = L.a.name;
+    while (name.length > 3 && ctx.measureText(name + val).width > maxLabelW) name = name.slice(0, -2).trimEnd() + "…";
+    ctx.fillText(name + val, cx + R + 8, cy);
+  }
+
+  // Axes + title + big date.
+  ctx.strokeStyle = "#f3e8ff";
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(x0, yTop);
+  ctx.lineTo(x0, yBot);
+  ctx.lineTo(x1 + 8, yBot);
+  ctx.stroke();
+  ctx.textBaseline = "alphabetic";
+  ctx.fillStyle = "#c9b8e0";
+  ctx.font = `${fs + 1}px Inter, system-ui, sans-serif`;
+  ctx.fillText(
+    `Top ${data.top} ${data.top === 1 ? RACE_KIND_LABEL[data.kind].slice(0, -1) : RACE_KIND_LABEL[data.kind]} · ` +
+      (data.trail ? `minutes listened in the trailing ${data.trail} days` : "total minutes listened (all time)"),
+    x0 + 6,
+    26
+  );
+  ctx.fillStyle = "#fff";
+  ctx.font = `600 ${Math.max(24, Math.min(46, w / 24))}px Fraunces, Georgia, serif`;
+  const dateStr = new Date(offToDayStr(lo + d) + "T00:00:00Z").toLocaleDateString(undefined, {
+    timeZone: "UTC",
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+  });
+  ctx.fillText(dateStr, x0 + 6, 26 + Math.max(24, Math.min(46, w / 24)) + 4);
+}
+
+function raceSyncControls() {
+  const N = race.data ? race.data.N : 1;
+  const scrub = document.getElementById("race-scrub");
+  scrub.min = String(race.data ? race.data.start : 0);
+  scrub.max = String(N - 1);
+  if (!race.scrubbing) scrub.value = String(race.t);
+  document.getElementById("race-play").textContent = race.playing ? "Pause" : race.t >= N - 1 ? "Replay" : "Play";
+}
+
+/** Date labels under the slider, spanning the (trimmed) playable range. */
+function raceRenderTicks() {
+  const el = document.getElementById("race-ticks");
+  const data = race.data;
+  if (!data) {
+    el.innerHTML = "";
+    return;
+  }
+  const span = data.N - 1 - data.start;
+  const fmt = new Intl.DateTimeFormat(undefined, {
+    timeZone: "UTC",
+    year: "numeric",
+    month: "short",
+    ...(span > 240 ? {} : { day: "numeric" }),
+  });
+  const count = 5;
+  el.innerHTML = Array.from({ length: count }, (_, i) => {
+    const off = data.lo + data.start + Math.round((span * i) / (count - 1));
+    return `<span>${fmt.format(new Date(offToDayStr(off) + "T00:00:00Z"))}</span>`;
+  }).join("");
+}
+
+function raceFrame(now) {
+  if (!race.playing || !race.data) return;
+  const dt = Math.min((now - race.last) / 1000, 0.1);
+  race.last = now;
+  const end = race.data.N - 1;
+  race.t = Math.min(end, race.t + race.speed * dt);
+  if (race.t >= end) race.playing = false;
+  drawRace();
+  raceSyncControls();
+  if (race.playing) race.raf = requestAnimationFrame(raceFrame);
+}
+
+function racePlay(fromStart) {
+  if (!race.data) return;
+  race.pending = false;
+  if (fromStart || race.t >= race.data.N - 1) race.t = race.data.start;
+  race.playing = true;
+  race.last = performance.now();
+  cancelAnimationFrame(race.raf);
+  race.raf = requestAnimationFrame(raceFrame);
+  raceSyncControls();
+}
+
+function racePause() {
+  race.playing = false;
+  cancelAnimationFrame(race.raf);
+  raceSyncControls();
+}
+
+/** (Re)build for the current date range; autoplay once the card is on screen. */
+function renderRace() {
+  racePause();
+  race.data = buildRaceData();
+  race.t = race.data ? race.data.start : 0;
+  raceResize();
+  drawRace();
+  raceSyncControls();
+  raceRenderTicks();
+  if (!race.data) return;
+  if (prefersReducedMotion()) {
+    race.t = race.data.N - 1;
+    drawRace();
+    raceSyncControls();
+    return;
+  }
+  const card = document.getElementById("c-race").closest(".chart-card");
+  race.pending = true;
+  if (!("IntersectionObserver" in window)) return racePlay(true);
+  if (!race.observer) {
+    race.observer = new IntersectionObserver(
+      (entries) => {
+        if (race.pending && entries.some((e) => e.isIntersecting)) racePlay(true);
+      },
+      { threshold: 0.35 }
+    );
+    race.observer.observe(card);
+  } else {
+    const r = card.getBoundingClientRect();
+    if (r.top < window.innerHeight * 0.65 && r.bottom > 0) racePlay(true);
+  }
+}
+
+/** Rebuild after a kind/trail/filter change, keeping the current position and play state. */
+function raceRebuild() {
+  const t = race.t;
+  race.data = buildRaceData();
+  if (!race.data) racePause();
+  race.t = race.data ? Math.max(race.data.start, Math.min(t, race.data.N - 1)) : 0;
+  drawRace();
+  raceSyncControls();
+  raceRenderTicks();
+}
+
+function renderRaceChips() {
+  const host = document.getElementById("race-chips");
+  const byName = new Map(DATA.artists.map((a) => [a.name, a]));
+  host.innerHTML = [...race.filter.names]
+    .map((n) => {
+      const img = byName.get(n)?.image;
+      return `<span class="chip">${img ? `<img src="${escAttr(img)}" alt="" />` : ""}${escHtml(n)}` +
+        `<button type="button" data-name="${escAttr(n)}" aria-label="Remove ${escAttr(n)}">×</button></span>`;
+    })
+    .join("");
+  document.getElementById("race-clear").hidden = race.filter.names.size === 0;
+}
+
+function wireRaceControls() {
+  const input = document.getElementById("race-artist-input");
+  document.getElementById("race-artist-dl").innerHTML = DATA.artists
+    .slice(0, 1000)
+    .map((a) => `<option value="${escAttr(a.name)}"></option>`)
+    .join("");
+  const addArtist = () => {
+    const name = input.value.trim();
+    if (!DATA.artists.some((a) => a.name === name)) return;
+    race.filter.names.add(name);
+    input.value = "";
+    renderRaceChips();
+    raceRebuild();
+  };
+  input.addEventListener("input", addArtist); // fires when a datalist option is picked
+  input.addEventListener("keydown", (e) => e.key === "Enter" && addArtist());
+  document.getElementById("race-chips").addEventListener("click", (e) => {
+    const btn = e.target.closest("button[data-name]");
+    if (!btn) return;
+    race.filter.names.delete(btn.dataset.name);
+    renderRaceChips();
+    raceRebuild();
+  });
+  document.getElementById("race-clear").addEventListener("click", () => {
+    race.filter.names.clear();
+    renderRaceChips();
+    raceRebuild();
+  });
+  document.getElementById("race-fmode").addEventListener("change", (e) => {
+    race.filter.mode = e.target.value;
+    raceRebuild();
+  });
+  document.getElementById("race-trail").addEventListener("change", (e) => {
+    race.trail = +e.target.value;
+    raceRebuild();
+  });
+  document.getElementById("race-kind").addEventListener("change", (e) => {
+    race.kind = e.target.value;
+    raceRebuild();
+  });
+  renderRaceChips();
+
+  race.speed = +document.getElementById("race-speed").value;
+  race.win = +document.getElementById("race-window").value;
+  document.getElementById("race-play").addEventListener("click", () => (race.playing ? racePause() : racePlay(false)));
+  document.getElementById("race-restart").addEventListener("click", () => racePlay(true));
+  document.getElementById("race-speed").addEventListener("change", (e) => (race.speed = +e.target.value));
+  document.getElementById("race-window").addEventListener("change", (e) => {
+    race.win = +e.target.value;
+    drawRace();
+  });
+  document.getElementById("race-scrub").addEventListener("input", (e) => {
+    race.pending = false;
+    race.t = +e.target.value;
+    racePause();
+    drawRace();
+  });
+  const scrub = document.getElementById("race-scrub");
+  scrub.addEventListener("pointerdown", () => (race.scrubbing = true));
+  window.addEventListener("pointerup", () => (race.scrubbing = false));
+  window.addEventListener("pointercancel", () => (race.scrubbing = false));
+  const host = document.getElementById("c-race").parentElement;
+  if ("ResizeObserver" in window) {
+    new ResizeObserver(() => {
+      if (host.clientWidth && (host.clientWidth !== race.w || host.clientHeight !== race.h)) {
+        raceResize();
+        drawRace();
+      }
+    }).observe(host);
+  }
+}
+
+/* ---------- Artist web (d3 force graph) ---------- */
+
+const WEB_PALETTE = ["#c026d3", "#db2777", "#6366f1", "#f97316", "#0ea5e9", "#10b981", "#eab308", "#9333ea"];
+const WEB_MIN_SHARED = 2;     // sessions two artists must share to be linked
+const WEB_LINKS_PER_NODE = 3; // strongest links kept per artist (declutters the graph)
+const WEB_PAIR_STRIDE = 1e4;  // pair key = lo * stride + hi (artist idx < graph_artist_cap)
+
+let webSim = null;
+
+/** Co-listening links among the top `count` artists in the current date range. */
+function buildWebGraph(count) {
+  const cap = DATA.graph_artist_cap || 0;
+  const idxByName = new Map(DATA.artists.slice(0, cap).map((a, i) => [a.name, i]));
+  const top = rankArtists(state.fromDay, state.toDay)
+    .filter((a) => idxByName.has(a.name))
+    .slice(0, count)
+    .map((a) => ({ ...a, idx: idxByName.get(a.name) }));
+  const nodeByIdx = new Map(top.map((n) => [n.idx, n]));
+
+  const lo = dayStrToOff(state.fromDay),
+    hi = dayStrToOff(state.toDay);
+  const sessCount = new Map();
+  const pair = new Map();
+  for (const [day, arts] of DATA.artist_sessions || []) {
+    if (day < lo || day > hi) continue;
+    const members = arts.filter((i) => nodeByIdx.has(i)); // arts is sorted ascending
+    for (const i of members) sessCount.set(i, (sessCount.get(i) || 0) + 1);
+    for (let a = 0; a < members.length; a++) {
+      for (let b = a + 1; b < members.length; b++) {
+        const k = members[a] * WEB_PAIR_STRIDE + members[b];
+        pair.set(k, (pair.get(k) || 0) + 1);
+      }
+    }
+  }
+
+  // Cosine-normalised strength so heavy-rotation artists don't link to everything.
+  const cand = [];
+  for (const [k, shared] of pair) {
+    if (shared < WEB_MIN_SHARED) continue;
+    const s = Math.floor(k / WEB_PAIR_STRIDE),
+      t = k % WEB_PAIR_STRIDE;
+    cand.push({ s, t, shared, w: shared / Math.sqrt(sessCount.get(s) * sessCount.get(t)) });
+  }
+  cand.sort((x, y) => y.w - x.w);
+  const used = new Map();
+  const links = [];
+  for (const l of cand) {
+    if ((used.get(l.s) || 0) < WEB_LINKS_PER_NODE || (used.get(l.t) || 0) < WEB_LINKS_PER_NODE) {
+      used.set(l.s, (used.get(l.s) || 0) + 1);
+      used.set(l.t, (used.get(l.t) || 0) + 1);
+      links.push(l);
+    }
+  }
+
+  const linked = new Set(links.flatMap((l) => [l.s, l.t]));
+  const nodes = top.filter((n) => linked.has(n.idx));
+  const byIdx = new Map(nodes.map((n) => [n.idx, n]));
+
+  // Weighted label propagation to colour clusters.
+  const adj = new Map(nodes.map((n) => [n.idx, []]));
+  for (const l of links) {
+    adj.get(l.s).push([l.t, l.w]);
+    adj.get(l.t).push([l.s, l.w]);
+  }
+  const label = new Map(nodes.map((n) => [n.idx, n.idx]));
+  for (let it = 0; it < 15; it++) {
+    let changed = false;
+    for (const n of nodes) {
+      const tally = new Map();
+      for (const [o, w] of adj.get(n.idx)) tally.set(label.get(o), (tally.get(label.get(o)) || 0) + w);
+      let best = label.get(n.idx),
+        bw = -1;
+      for (const [lab, w] of tally) if (w > bw || (w === bw && lab < best)) { best = lab; bw = w; }
+      if (best !== label.get(n.idx)) { label.set(n.idx, best); changed = true; }
+    }
+    if (!changed) break;
+  }
+  const groupIds = [...new Set(nodes.map((n) => label.get(n.idx)))];
+  nodes.forEach((n) => (n.group = groupIds.indexOf(label.get(n.idx))));
+
+  return {
+    nodes,
+    links: links.map((l) => ({ source: byIdx.get(l.s), target: byIdx.get(l.t), w: l.w, shared: l.shared })),
+    hidden: top.length - nodes.length,
+  };
+}
+
+function renderArtistWeb() {
+  const host = document.getElementById("web-host");
+  const hint = document.getElementById("web-hint");
+  const tip = document.getElementById("web-tip");
+  if (webSim) webSim.stop();
+  host.innerHTML = "";
+  tip.hidden = true;
+
+  if (typeof d3 === "undefined") {
+    host.innerHTML = `<p class="web-empty">d3 failed to load, so the artist web is unavailable.</p>`;
+    return;
+  }
+  const count = +document.getElementById("web-count").value || 40;
+  const { nodes, links, hidden } = buildWebGraph(count);
+  if (nodes.length < 2) {
+    host.innerHTML = `<p class="web-empty">Not enough shared listening sessions in this range to link artists.</p>`;
+    return;
+  }
+  hint.textContent =
+    "Drag nodes · scroll to zoom · hover to highlight · click to open Artist dive" +
+    (hidden ? ` · ${hidden} unlinked artist${hidden > 1 ? "s" : ""} hidden` : "");
+
+  const W = host.clientWidth || 900;
+  const H = Math.max(420, Math.min(680, Math.round(W * 0.62)));
+  const maxMs = Math.max(...nodes.map((n) => n.fm));
+  const radius = (n) => 9 + 24 * Math.sqrt(n.fm / maxMs);
+  const color = (n) => WEB_PALETTE[n.group % WEB_PALETTE.length];
+
+  const svg = d3.select(host).append("svg")
+    .attr("viewBox", `0 0 ${W} ${H}`).attr("width", "100%").attr("height", H)
+    .attr("role", "img").attr("aria-label", "Force graph of related top artists");
+  const defs = svg.append("defs");
+  nodes.forEach((n) => {
+    if (!n.image) return;
+    defs.append("pattern").attr("id", `web-img-${n.idx}`)
+      .attr("patternContentUnits", "objectBoundingBox").attr("width", 1).attr("height", 1)
+      .append("image").attr("href", n.image).attr("width", 1).attr("height", 1)
+      .attr("preserveAspectRatio", "xMidYMid slice");
+  });
+
+  const root = svg.append("g");
+  svg.call(d3.zoom().scaleExtent([0.4, 4]).on("zoom", (e) => root.attr("transform", e.transform)));
+
+  const wMax = Math.max(...links.map((l) => l.w));
+  const link = root.append("g").attr("class", "web-links").selectAll("line").data(links).join("line")
+    .attr("stroke-width", (l) => 1 + 5 * (l.w / wMax))
+    .attr("stroke-opacity", (l) => 0.18 + 0.5 * (l.w / wMax));
+
+  const node = root.append("g").selectAll("g").data(nodes).join("g").attr("class", "web-node");
+  node.append("circle").attr("r", radius)
+    .attr("fill", (n) => (n.image ? `url(#web-img-${n.idx})` : color(n)))
+    .attr("stroke", color).attr("stroke-width", 3);
+  node.filter((n) => !n.image).append("text").attr("class", "web-initial")
+    .attr("text-anchor", "middle").attr("dy", "0.35em")
+    .text((n) => (n.name.trim()[0] || "?").toUpperCase());
+  node.append("text").attr("class", "web-label").attr("text-anchor", "middle")
+    .attr("dy", (n) => radius(n) + 12).text((n) => n.name);
+
+  const nbrs = new Map(nodes.map((n) => [n, new Map()]));
+  for (const l of links) {
+    nbrs.get(l.source).set(l.target, l);
+    nbrs.get(l.target).set(l.source, l);
+  }
+
+  node
+    .on("mouseenter", (e, n) => {
+      const near = nbrs.get(n);
+      node.classed("dim", (o) => o !== n && !near.has(o));
+      link.classed("dim", (l) => l.source !== n && l.target !== n)
+        .classed("hot", (l) => l.source === n || l.target === n);
+      const top5 = [...near].sort((a, b) => b[1].w - a[1].w).slice(0, 5);
+      tip.innerHTML =
+        `<strong>${escHtml(n.name)}</strong><br>${listeningFriendlyPlain(n.fm / 60000)}` +
+        `<ul>${top5.map(([o, l]) => `<li>${escHtml(o.name)} <span>${l.shared} sessions</span></li>`).join("")}</ul>`;
+      tip.hidden = false;
+    })
+    .on("mousemove", (e) => {
+      const r = host.getBoundingClientRect();
+      tip.style.left = `${Math.min(e.clientX - r.left + 14, r.width - 210)}px`;
+      tip.style.top = `${e.clientY - r.top + 14}px`;
+    })
+    .on("mouseleave", () => {
+      node.classed("dim", false);
+      link.classed("dim", false).classed("hot", false);
+      tip.hidden = true;
+    })
+    .on("click", (e, n) => {
+      document.getElementById("artist-input").value = n.name;
+      renderArtistChart();
+      document.getElementById("artist").scrollIntoView({ behavior: "smooth" });
+    });
+
+  const tick = () => {
+    link.attr("x1", (l) => l.source.x).attr("y1", (l) => l.source.y)
+      .attr("x2", (l) => l.target.x).attr("y2", (l) => l.target.y);
+    node.attr("transform", (n) => `translate(${n.x},${n.y})`);
+  };
+  webSim = d3.forceSimulation(nodes)
+    .force("link", d3.forceLink(links).distance((l) => 190 - 100 * (l.w / wMax)).strength((l) => 0.15 + 0.6 * (l.w / wMax)))
+    .force("charge", d3.forceManyBody().strength(-520))
+    .force("center", d3.forceCenter(W / 2, H / 2))
+    .force("x", d3.forceX(W / 2).strength(0.04))
+    .force("y", d3.forceY(H / 2).strength(0.06))
+    .force("collide", d3.forceCollide((n) => radius(n) + 18))
+    .on("tick", tick);
+  if (prefersReducedMotion()) {
+    webSim.stop().tick(300);
+    tick();
+  }
+
+  node.call(d3.drag()
+    .on("start", (e, n) => { if (!e.active) webSim.alphaTarget(0.25).restart(); n.fx = n.x; n.fy = n.y; })
+    .on("drag", (e, n) => { n.fx = e.x; n.fy = e.y; })
+    .on("end", (e, n) => { if (!e.active) webSim.alphaTarget(0); n.fx = n.fy = null; }));
+}
+
+function wireWebControls() {
+  document.getElementById("web-count").addEventListener("change", renderArtistWeb);
+  let timer = 0,
+    lastW = 0;
+  window.addEventListener("resize", () => {
+    clearTimeout(timer);
+    timer = setTimeout(() => {
+      const w = document.getElementById("web-host").clientWidth;
+      if (w && w !== lastW) { lastW = w; renderArtistWeb(); }
+    }, 250);
+  });
 }
 
 bootstrap();

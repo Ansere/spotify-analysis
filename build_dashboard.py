@@ -25,6 +25,13 @@ OUT_HTML = BASE / "dashboard.html"
 AUDIO_GLOB = "Streaming_History_Audio_*.json"
 ART_CACHE_PATH = BASE / "art_cache.json"
 
+# Artist relationship graph: artists are "related" when they show up in the same
+# listening session. Only the top GRAPH_ARTIST_CAP artists (by minutes) are
+# tracked, so artist index i in a session row is also DATA.artists[i] in the JS.
+GRAPH_ARTIST_CAP = 400
+GRAPH_SESSION_GAP = timedelta(minutes=30)
+GRAPH_MIN_PLAY_MS = 30_000
+
 logger = logging.getLogger(__name__)
 
 
@@ -190,6 +197,39 @@ def load_art_cache() -> dict:
         return {}
 
 
+def build_artist_sessions(
+    play_log: list[tuple[datetime, str]],
+    artist_idx: dict[str, int],
+    epoch_date: date | None,
+) -> list[list]:
+    """Split plays into sessions (gap > GRAPH_SESSION_GAP) and return
+    `[day_index, [artist_idx, ...]]` for each session containing 2+ tracked
+    artists. The frontend turns these into co-listening links for any date range."""
+    if epoch_date is None:
+        return []
+    out: list[list] = []
+    cur: set[int] = set()
+    start: datetime | None = None
+    last: datetime | None = None
+
+    def flush() -> None:
+        if start is not None and len(cur) >= 2:
+            day = start.astimezone(DISPLAY_TZ).date().isoformat()
+            out.append([day_index(day, epoch_date), sorted(cur)])
+
+    for dt, name in sorted(play_log, key=lambda x: x[0]):
+        if last is None or dt - last > GRAPH_SESSION_GAP:
+            flush()
+            cur = set()
+            start = dt
+        last = dt
+        idx = artist_idx.get(name)
+        if idx is not None:
+            cur.add(idx)
+    flush()
+    return out
+
+
 def top_recent_streams(events: list[dict], n: int = 20) -> list[dict]:
     """Most recent `n` music plays by `ts` (O(n log k) over the event list)."""
 
@@ -259,6 +299,8 @@ def main() -> None:
     album_daily: defaultdict[str, defaultdict[str, tuple[int, int]]] = defaultdict(
         lambda: defaultdict(lambda: (0, 0))
     )
+
+    play_log: list[tuple[datetime, str]] = []
 
     earliest: datetime | None = None
     latest: datetime | None = None
@@ -341,6 +383,8 @@ def main() -> None:
 
         artist_ms[artist_name] += ms
         artist_n[artist_name] += 1
+        if ms >= GRAPH_MIN_PLAY_MS and artist_name != "Unknown Artist":
+            play_log.append((dt, artist_name))
 
         ad = artist_daily[artist_name]
         cms, cn = ad[dkey]
@@ -393,6 +437,12 @@ def main() -> None:
                 "days": compact_days(days_raw),
             }
         )
+
+    artist_sessions = build_artist_sessions(
+        play_log,
+        {a: i for i, a in enumerate(top_artists[:GRAPH_ARTIST_CAP])},
+        epoch_date,
+    )
 
     top_track_keys = sorted(track_bucket.keys(), key=lambda k: (-track_bucket[k]["ms"], k))
     tracks_out = []
@@ -512,6 +562,8 @@ def main() -> None:
         "tracks": tracks_out,
         "albums": albums_out,
         "recent_streams": recent_streams,
+        "artist_sessions": artist_sessions,
+        "graph_artist_cap": GRAPH_ARTIST_CAP,
         "notes": (
             "Spotify Extended Streaming History does not include genre metadata; podcast/audiobook rows excluded. "
             "Tracks and albums collapse duplicate rows that match the same normalized title + performer "
