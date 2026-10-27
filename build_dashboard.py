@@ -11,6 +11,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import genres
 import spotify_sync
 
 # Global display timezone. All user-facing day/month/year buckets, the heatmap,
@@ -24,11 +25,14 @@ TEMPLATE = BASE / "template.html"
 OUT_HTML = BASE / "dashboard.html"
 AUDIO_GLOB = "Streaming_History_Audio_*.json"
 ART_CACHE_PATH = BASE / "art_cache.json"
+LASTFM_CACHE_PATH = BASE / "lastfm_cache.json"
 
 # Artist relationship graph: artists are "related" when they show up in the same
-# listening session. Only the top GRAPH_ARTIST_CAP artists (by minutes) are
-# tracked, so artist index i in a session row is also DATA.artists[i] in the JS.
-GRAPH_ARTIST_CAP = 400
+# listening session. Only artists with at least GRAPH_MIN_PLAYS plays (the long tail of
+# one- and two-play artists adds clutter, not signal) are tracked. They are placed first in
+# the artist list, so artist index i in a session/walk/link row is also DATA.artists[i] in the JS.
+GRAPH_MIN_PLAYS = 3
+GRAPH_ARTIST_CAP = 100_000  # hard ceiling on top of the play threshold
 GRAPH_SESSION_GAP = timedelta(minutes=30)
 GRAPH_MIN_PLAY_MS = 30_000
 
@@ -195,6 +199,51 @@ def load_art_cache() -> dict:
             return json.load(f)
     except (OSError, json.JSONDecodeError):
         return {}
+
+
+def load_lastfm_cache() -> dict:
+    """Read-only lookup into lastfm_cache.json (populated by lastfm_sync.py).
+    Missing or unparsable just means no tags/similar links yet; never raises."""
+    try:
+        with open(LASTFM_CACHE_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def build_lastfm_links(top_artists: list[str], lastfm: dict) -> list[list]:
+    """`[i, j, match]` (i < j, indices into the top GRAPH_ARTIST_CAP artists) for
+    Last.fm similar-artist pairs where both artists are in the library. When both
+    directions are cached the stronger match wins."""
+    idx = {a.lower(): i for i, a in enumerate(top_artists[:GRAPH_ARTIST_CAP])}
+    best: dict[tuple[int, int], float] = {}
+    for name, i in idx.items():
+        for other, match in (lastfm.get(f"artist:{name}") or {}).get("similar") or []:
+            j = idx.get(str(other).lower())
+            if j is None or j == i:
+                continue
+            key = (min(i, j), max(i, j))
+            best[key] = max(best.get(key, 0.0), float(match))
+    return [[i, j, round(m, 3)] for (i, j), m in sorted(best.items())]
+
+
+def build_map_walk(
+    play_log: list[tuple[datetime, str]],
+    artist_idx: dict[str, int],
+    epoch_date: date | None,
+) -> list[list]:
+    """`[day_index, [minute_of_day, artist_idx, ...]]` per local day, plays in order,
+    for the top GRAPH_ARTIST_CAP artists. Drives the taste map's daily walk."""
+    if epoch_date is None:
+        return []
+    days: dict[int, list[int]] = {}
+    for dt, name in sorted(play_log, key=lambda x: x[0]):
+        idx = artist_idx.get(name)
+        if idx is None:
+            continue
+        local = dt.astimezone(DISPLAY_TZ)
+        days.setdefault((local.date() - epoch_date).days, []).extend((local.hour * 60 + local.minute, idx))
+    return [[d, flat] for d, flat in sorted(days.items())]
 
 
 def build_artist_sessions(
@@ -423,26 +472,47 @@ def main() -> None:
         ]
 
     art_cache = load_art_cache()
+    lastfm_cache = load_lastfm_cache()
 
-    top_artists = sorted(artist_ms.keys(), key=lambda a: (-artist_ms[a], a.lower()))
+    # Graph-worthy artists first (each group by minutes), so they form a prefix of the list.
+    top_artists = sorted(artist_ms.keys(), key=lambda a: (artist_n[a] < GRAPH_MIN_PLAYS, -artist_ms[a], a.lower()))
+    graph_n = min(GRAPH_ARTIST_CAP, sum(1 for a in top_artists if artist_n[a] >= GRAPH_MIN_PLAYS))
     artists_out = []
     for a in top_artists:
         days_raw = artist_daily[a]
-        artists_out.append(
-            {
-                "name": a,
-                "ms": artist_ms[a],
-                "n": artist_n[a],
-                "image": art_cache.get(f"artist:{a.lower()}"),
-                "days": compact_days(days_raw),
-            }
-        )
+        entry = {
+            "name": a,
+            "ms": artist_ms[a],
+            "n": artist_n[a],
+            "image": art_cache.get(f"artist:{a.lower()}"),
+            "days": compact_days(days_raw),
+        }
+        tags = (lastfm_cache.get(f"artist:{a.lower()}") or {}).get("tags")
+        if tags:
+            entry["tags"] = tags
+        artists_out.append(entry)
+
+    # One genre per graph artist (merged tag families, specific over generic, neighbours fill the gaps).
+    graph_links = build_lastfm_links(top_artists[:graph_n], lastfm_cache)
+    genre_names, genre_idx, genre_inferred = genres.assign_genres(
+        [e.get("tags", []) for e in artists_out[:graph_n]],
+        [e["ms"] / 60000 for e in artists_out[:graph_n]],
+        graph_links,
+    )
+    for e, g, inferred in zip(artists_out[:graph_n], genre_idx, genre_inferred):
+        if g is not None:
+            e["g"] = g
+            if inferred:
+                e["gi"] = 1
 
     artist_sessions = build_artist_sessions(
         play_log,
-        {a: i for i, a in enumerate(top_artists[:GRAPH_ARTIST_CAP])},
+        {a: i for i, a in enumerate(top_artists[:graph_n])},
         epoch_date,
     )
+
+    artist_idx = {a: i for i, a in enumerate(top_artists[:graph_n])}
+    map_walk = build_map_walk(play_log, artist_idx, epoch_date)
 
     top_track_keys = sorted(track_bucket.keys(), key=lambda k: (-track_bucket[k]["ms"], k))
     tracks_out = []
@@ -563,7 +633,10 @@ def main() -> None:
         "albums": albums_out,
         "recent_streams": recent_streams,
         "artist_sessions": artist_sessions,
-        "graph_artist_cap": GRAPH_ARTIST_CAP,
+        "graph_artist_cap": graph_n,
+        "lastfm_links": graph_links,
+        "genres": genre_names,
+        "map_walk": map_walk,
         "notes": (
             "Spotify Extended Streaming History does not include genre metadata; podcast/audiobook rows excluded. "
             "Tracks and albums collapse duplicate rows that match the same normalized title + performer "
