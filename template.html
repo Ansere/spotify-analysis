@@ -6,7 +6,7 @@
   <title>Spotify Listening — Audio Analytics</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400;0,9..144,600;0,9..144,900;1,9..144,500&family=Inter:wght@400;500;600;700&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet" />
+  <link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400;0,9..144,600;0,9..144,900;1,9..144,500&family=Inter:wght@400;500;600;700;800&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet" />
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/d3@7.9.0/dist/d3.min.js"></script>
   <link rel="stylesheet" href="/dashboard.css" />
@@ -19,8 +19,10 @@
         <span class="toc-label">Jump to...</span>
         <a href="#snapshot">Snapshot</a>
         <a href="#trends">Trends</a>
+        <a href="#heatmap">Heatmap</a>
         <a href="#artist">Artist dive</a>
         <a href="#artist-web">Artist web</a>
+        <a href="#taste-section" id="toc-taste" hidden>Taste map</a>
         <a href="#recent-plays">Recent plays</a>
         <a href="#rankings">Rankings</a>
       </div>
@@ -85,10 +87,17 @@
           <div class="anim-controls">
             <button type="button" id="race-play">Play</button>
             <button type="button" class="secondary" id="race-restart">Restart</button>
+            <select id="race-view" aria-label="What the lines show">
+              <option value="value" selected>Minutes</option>
+              <option value="share">% of all listening</option>
+              <option value="streak">Listening streak</option>
+              <option value="top1">Longest #1 streak</option>
+            </select>
             <select id="race-kind" aria-label="What to rank">
               <option value="artists" selected>Artists</option>
               <option value="tracks">Tracks</option>
               <option value="albums">Albums</option>
+              <option value="tags">Tags</option>
             </select>
             <select id="race-trail" aria-label="Minutes counted over">
               <option value="7">Last 7 days</option>
@@ -97,10 +106,10 @@
               <option value="0">All time</option>
             </select>
             <select id="race-speed" aria-label="Playback speed">
-              <option value="20">Slow</option>
-              <option value="60" selected>Normal</option>
-              <option value="150">Fast</option>
-              <option value="400">Very fast</option>
+              <option value="90">Slow (90 s)</option>
+              <option value="45" selected>Normal (45 s)</option>
+              <option value="20">Fast (20 s)</option>
+              <option value="10">Very fast (10 s)</option>
             </select>
             <select id="race-window" aria-label="Visible time window">
               <option value="28">4 weeks</option>
@@ -119,19 +128,54 @@
           <datalist id="race-artist-dl"></datalist>
           <div class="race-chips" id="race-chips"></div>
           <button type="button" class="secondary" id="race-clear" hidden>Clear</button>
+          <select id="race-tag" aria-label="Filter by Last.fm tag" hidden></select>
         </div>
         <div class="race-host"><canvas id="c-race" role="img" aria-label="Animated line graph of top artists' minutes over time"></canvas></div>
         <input type="range" id="race-scrub" min="0" max="1" step="0.01" value="0" aria-label="Scrub through time" />
         <div class="race-ticks" id="race-ticks" aria-hidden="true"></div>
       </div>
+      <div class="chart-card chart-card--full" id="river-card" hidden>
+        <div class="anim-head">
+          <h3>Taste river</h3>
+          <div class="anim-controls">
+            <select id="river-count" aria-label="How many tags to show">
+              <option value="8">Top 8 tags</option>
+              <option value="12" selected>Top 12 tags</option>
+              <option value="16">Top 16 tags</option>
+              <option value="24">Top 24 tags</option>
+            </select>
+          </div>
+        </div>
+        <div class="river-wrap">
+          <div class="river-host" id="river-host"></div>
+          <div class="web-tip" id="river-tip" hidden></div>
+        </div>
+        <p class="race-note">Stream width is how much you listened to each Last.fm tag. An artist counts toward all of its tags, so streams overlap. Hover a stream for details.</p>
+      </div>
       <div class="chart-card chart-card--full chart-card--tall">
-        <h3>Minutes by month</h3>
+        <h3 id="h-month">Minutes by month</h3>
         <div class="chart-canvas-wrap chart-canvas-wrap--line"><canvas id="c-month"></canvas></div>
       </div>
       <div class="chart-card chart-card--full chart-card--tall">
-        <h3>Minutes by year</h3>
+        <h3 id="h-year">Minutes by year</h3>
         <div class="chart-canvas-wrap chart-canvas-wrap--line"><canvas id="c-year"></canvas></div>
       </div>
+    </div>
+    </section>
+
+    <section id="heatmap" class="anchor-section">
+    <div class="section-title">
+      <h2>Daily heatmap</h2>
+      <span>Every day of your listening at a glance</span>
+    </div>
+    <div class="chart-card chart-card--full">
+      <h3 id="heat-title">Plays per day</h3>
+      <p class="heat-summary" id="heat-summary"></p>
+      <div class="heat-wrap">
+        <div class="heat-host" id="heat-host"></div>
+        <div class="web-tip" id="heat-tip" hidden></div>
+      </div>
+      <div class="heat-legend" id="heat-legend"></div>
     </div>
     </section>
 
@@ -153,7 +197,7 @@
     <section id="artist-web" class="anchor-section">
     <div class="section-title">
       <h2>Artist web</h2>
-      <span>Top artists linked by how often you play them in the same session</span>
+      <span>Top artists linked by Last.fm similarity or by playing them in the same session</span>
     </div>
     <div class="chart-card chart-card--full">
       <div class="web-controls">
@@ -164,10 +208,137 @@
           <option value="60">Top 60</option>
           <option value="80">Top 80</option>
         </select>
+        <label for="web-links">Links</label>
+        <select id="web-links">
+          <option value="lastfm">Last.fm similar</option>
+          <option value="session">Same session</option>
+        </select>
+        <label for="web-color">Color</label>
+        <select id="web-color">
+          <option value="tag">Top tag</option>
+          <option value="cluster">Cluster</option>
+        </select>
         <span class="web-hint" id="web-hint">Drag nodes · scroll to zoom · hover to highlight</span>
       </div>
+      <div class="web-legend" id="web-legend"></div>
       <div class="web-host" id="web-host"></div>
       <div class="web-tip" id="web-tip" hidden></div>
+    </div>
+    </section>
+
+    <section id="taste-section" class="anchor-section" hidden>
+    <div class="section-title">
+      <h2>Taste map</h2>
+      <span>Your artists placed by Last.fm similarity, lighting up as you discover them</span>
+    </div>
+    <p class="race-note" id="taste-status" hidden></p>
+    <div class="chart-card chart-card--full" hidden>
+      <div class="anim-head">
+        <h3>Where your listening lives</h3>
+        <div class="anim-controls">
+          <button type="button" id="map-play">Play</button>
+          <button type="button" class="secondary" id="map-restart">Restart</button>
+          <select id="map-overlay" aria-label="Map overlay">
+            <option value="none" selected>No overlay</option>
+            <option value="trail">Trail: last 30 days' center</option>
+            <option value="trailAll">Trail: all-time center</option>
+            <option value="explore">Glow explored territory</option>
+          </select>
+          <select id="map-mode" aria-label="Which artists to light up">
+            <option value="ever" selected>Everything heard so far</option>
+            <option value="recent">Last 30 days</option>
+          </select>
+          <select id="map-layout" aria-label="How the map is arranged">
+            <option value="similarity" selected>Layout: similarity</option>
+            <option value="genre">Layout: anchored by genre</option>
+          </select>
+          <select id="map-color" aria-label="What the dot colors mean">
+            <option value="tag" selected>Color: top tag</option>
+            <option value="recency">Color: recency of listening</option>
+            <option value="rank">Color: recency, ranked</option>
+          </select>
+          <button type="button" class="secondary" id="map-reset" hidden>Reset view</button>
+          <select id="map-labels" aria-label="Which labels to show">
+            <option value="artists" selected>Labels: artist names</option>
+            <option value="zones">Labels: genres</option>
+            <option value="both">Labels: names + genres</option>
+            <option value="none">Labels: none</option>
+          </select>
+          <select id="map-zonemode" aria-label="How genre labels behave">
+            <option value="steady" selected>Genre labels: steady</option>
+            <option value="reactive">Genre labels: react to listening</option>
+          </select>
+          <select id="map-ghosts" aria-label="What to do with artists you have not discovered yet">
+            <option value="dim" selected>Undiscovered: dimmed</option>
+            <option value="hide">Undiscovered: hidden</option>
+          </select>
+          <select id="map-speed" aria-label="Playback speed">
+            <option value="90">Slow (90 s)</option>
+              <option value="45" selected>Normal (45 s)</option>
+              <option value="20">Fast (20 s)</option>
+              <option value="10">Very fast (10 s)</option>
+          </select>
+        </div>
+      </div>
+      <div class="web-legend" id="map-legend"></div>
+      <div class="race-host race-host--map"><canvas id="c-map" role="img" aria-label="Map of your top artists arranged by similarity, lighting up over time"></canvas><div class="web-tip" id="map-tip" hidden></div></div>
+      <input type="range" id="map-scrub" min="0" max="1" step="0.01" value="0" aria-label="Scrub through time" />
+      <div class="race-ticks" id="map-ticks" aria-hidden="true"></div>
+      <p class="race-note">Dot size follows the Minutes/Plays toggle. Colors follow the Color setting (top Last.fm tag, or when you listened to the artist, weighted by how much). Hover a dot for details; scroll to zoom, drag to pan, double-click to reset. Zoom in to reveal more genre labels.</p>
+    </div>
+    <div class="chart-card chart-card--full" id="walk-card" hidden>
+      <div class="anim-head">
+        <h3>Daily map walk</h3>
+        <div class="anim-controls">
+          <button type="button" class="secondary" id="walk-prev" aria-label="Previous day">‹</button>
+          <input type="date" id="walk-date" aria-label="Walk start date" />
+          <button type="button" class="secondary" id="walk-next" aria-label="Next day">›</button>
+          <select id="walk-span" aria-label="Length of the walk">
+            <option value="1" selected>One day</option>
+            <option value="7">One week</option>
+            <option value="0">All time</option>
+          </select>
+          <select id="walk-labels" aria-label="Genre labels on the walk">
+            <option value="reactive" selected>Genre labels: react to the walk</option>
+            <option value="steady">Genre labels: steady</option>
+            <option value="off">Genre labels: off</option>
+          </select>
+          <button type="button" class="secondary" id="walk-reset" hidden>Reset view</button>
+          <button type="button" id="walk-play">Play</button>
+          <button type="button" class="secondary" id="walk-restart">Restart</button>
+          <select id="walk-speed" aria-label="Playback speed">
+            <option value="60">Slow (60 s)</option>
+            <option value="30" selected>Normal (30 s)</option>
+            <option value="15">Fast (15 s)</option>
+            <option value="120">Epic (2 min)</option>
+            <option value="300">Marathon (5 min)</option>
+          </select>
+        </div>
+      </div>
+      <div class="race-host race-host--map"><canvas id="c-walk" role="img" aria-label="A dot hopping between artists on the taste map, one play at a time"></canvas><div class="web-tip" id="walk-tip" hidden></div></div>
+      <input type="range" id="walk-scrub" min="0" max="1" step="0.01" value="0" aria-label="Scrub through the plays" />
+      <p class="race-note">Each hop is one play (30 s or longer) by an artist on the map (3+ plays), in order. Pick any date, a week, or all time. Hover a dot for details, click one to jump to its next play, scroll to zoom, drag to pan, double-click to reset.</p>
+    </div>
+    <div class="chart-card chart-card--full" id="cmp-card" hidden>
+      <div class="anim-head">
+        <h3>Compare two periods</h3>
+        <div class="anim-controls">
+          <button type="button" class="secondary" id="cmp-reset" hidden>Reset view</button>
+          <select id="cmp-preset" aria-label="Comparison preset">
+            <option value="yoy90" selected>Last 90 days vs a year earlier</option>
+            <option value="prev30">Last 30 days vs the 30 before</option>
+            <option value="year">This year vs last year</option>
+            <option value="custom">Custom dates</option>
+          </select>
+        </div>
+      </div>
+      <div class="cmp-dates">
+        <label class="cmp-a"><i></i>A <input type="date" id="cmp-a0" /> to <input type="date" id="cmp-a1" /></label>
+        <label class="cmp-b"><i></i>B <input type="date" id="cmp-b0" /> to <input type="date" id="cmp-b1" /></label>
+      </div>
+      <div class="web-legend"><span><i style="background:#38bdf8"></i>more in A</span><span><i style="background:#e9d5ff"></i>about the same</span><span><i style="background:#fb923c"></i>more in B</span><span>Dot size = share of that period's listening</span></div>
+      <div class="race-host race-host--map"><canvas id="c-cmp" role="img" aria-label="Taste map coloured by how listening shifted between two periods"></canvas><div class="web-tip" id="cmp-tip" hidden></div></div>
+      <div class="cmp-lists" id="cmp-lists"></div>
     </div>
     </section>
 

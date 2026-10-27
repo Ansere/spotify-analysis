@@ -766,3 +766,164 @@ footer {
 .chip button { width: 20px; height: 20px; padding: 0; border: 0; border-radius: 50%; background: transparent; color: var(--muted); font-size: 1rem; line-height: 1; box-shadow: none; }
 .chip button:hover:not(:disabled) { background: rgba(42, 10, 74, 0.12); transform: none; }
 .race-ticks { display: flex; justify-content: space-between; margin: 0 0.3rem 0.4rem; font-family: var(--font-mono); font-size: 0.72rem; color: var(--muted); }
+.race-note { margin: 0 0 0.4rem; font-size: 0.78rem; color: var(--muted); }
+.web-controls select { width: auto; }
+.web-legend { display: flex; flex-wrap: wrap; gap: 0.3rem 0.9rem; margin-bottom: 0.6rem; font-size: 0.8rem; color: var(--text-soft); }
+.web-legend:empty { display: none; }
+.web-legend i { display: inline-block; width: 0.7rem; height: 0.7rem; margin-right: 0.35rem; border-radius: 50%; vertical-align: -1px; }
+.web-tags { color: var(--muted); font-size: 0.75rem; }
+.race-filter #race-tag { width: auto; }
+#map-scrub, #walk-scrub { width: 100%; margin: 0.7rem 0 0.3rem; accent-color: var(--accent-fuchsia); }
+.race-host--map { height: clamp(420px, 62vw, 720px); }
+.race-host--map canvas { cursor: grab; touch-action: none; }
+.race-host--map canvas.grabbing { cursor: grabbing; }
+#walk-date { width: auto; }
+
+/* Full screen for the animated cards (real Fullscreen API, or .is-fullscreen as a fallback).
+   A viewing mode: the visualization fills the screen, settings are hidden, and what is left (play
+   controls, slider, one-line legend) is styled to sit inside the visualization's dark theme. */
+.chart-card:fullscreen,
+.chart-card.is-fullscreen {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  grid-template-rows: 1fr auto auto auto;
+  grid-template-areas: "host host" "leg leg" "ctrl slider" "ctrl ticks";
+  box-sizing: border-box;
+  width: 100%;
+  max-width: none;
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  border: 0;
+  border-radius: 0;
+  background: #12061f;
+  color: #c9b8e0;
+}
+.chart-card.is-fullscreen { position: fixed; inset: 0; z-index: 1000; height: 100vh; }
+
+/* The picture fills everything above the control bar. */
+.chart-card:fullscreen .race-host,
+.chart-card.is-fullscreen .race-host {
+  grid-area: host;
+  height: auto;
+  min-height: 0;
+  border-radius: 0;
+}
+
+/* Settings and prose are for the normal view only. */
+.chart-card:fullscreen .anim-head h3, .chart-card.is-fullscreen .anim-head h3,
+.chart-card:fullscreen .anim-controls select, .chart-card.is-fullscreen .anim-controls select,
+.chart-card:fullscreen .anim-controls input, .chart-card.is-fullscreen .anim-controls input,
+.chart-card:fullscreen .race-filter, .chart-card.is-fullscreen .race-filter,
+.chart-card:fullscreen .cmp-dates, .chart-card.is-fullscreen .cmp-dates,
+.chart-card:fullscreen .cmp-lists, .chart-card.is-fullscreen .cmp-lists,
+.chart-card:fullscreen .race-note, .chart-card.is-fullscreen .race-note,
+.chart-card:fullscreen #walk-prev, .chart-card.is-fullscreen #walk-prev,
+.chart-card:fullscreen #walk-next, .chart-card.is-fullscreen #walk-next { display: none; }
+
+/* One-line legend. */
+.chart-card:fullscreen .web-legend,
+.chart-card.is-fullscreen .web-legend {
+  grid-area: leg;
+  flex-wrap: nowrap;
+  overflow: hidden;
+  white-space: nowrap;
+  gap: 0.2rem 0.7rem;
+  margin: 0;
+  padding: 0.35rem 1rem;
+  font-size: 0.7rem;
+  color: #c9b8e0;
+}
+.chart-card:fullscreen .web-legend i,
+.chart-card.is-fullscreen .web-legend i { width: 0.55rem; height: 0.55rem; }
+.chart-card:fullscreen .web-legend .map-grad,
+.chart-card.is-fullscreen .web-legend .map-grad { width: 120px; height: 8px; }
+
+/* Control bar: buttons on the left, slim slider and dates beside them. */
+.chart-card:fullscreen .anim-head,
+.chart-card.is-fullscreen .anim-head { grid-area: ctrl; align-self: center; padding: 0.4rem 0.5rem 0.4rem 1rem; }
+.chart-card:fullscreen .anim-controls,
+.chart-card.is-fullscreen .anim-controls { margin: 0; flex-wrap: nowrap; }
+.chart-card:fullscreen button,
+.chart-card.is-fullscreen button {
+  min-height: 0;
+  padding: 0.35rem 0.8rem;
+  border: 1px solid rgba(243, 232, 255, 0.18);
+  border-radius: 6px;
+  background: rgba(243, 232, 255, 0.08);
+  color: #f3e8ff;
+  font-size: 0.8rem;
+  box-shadow: none;
+}
+.chart-card:fullscreen button:hover:not(:disabled),
+.chart-card.is-fullscreen button:hover:not(:disabled) { background: rgba(243, 232, 255, 0.16); transform: none; }
+.chart-card:fullscreen .anim-controls button:not(.secondary),
+.chart-card.is-fullscreen .anim-controls button:not(.secondary) { background: rgba(192, 38, 211, 0.75); border-color: rgba(192, 38, 211, 0.9); }
+.chart-card:fullscreen .fs-btn,
+.chart-card.is-fullscreen .fs-btn { width: auto; min-height: 0; padding: 0.35rem 0.5rem; }
+
+.chart-card:fullscreen input[type="range"],
+.chart-card.is-fullscreen input[type="range"] {
+  grid-area: slider;
+  align-self: center;
+  -webkit-appearance: none;
+  appearance: none;
+  width: auto !important; /* beat the per-slider #id rules used in the normal view */
+  height: 6px;
+  margin: 0 1rem 0 0 !important;
+  border-radius: 3px;
+  background: rgba(243, 232, 255, 0.18);
+  outline: none;
+}
+.chart-card:fullscreen input[type="range"]::-webkit-slider-thumb,
+.chart-card.is-fullscreen input[type="range"]::-webkit-slider-thumb { -webkit-appearance: none; width: 14px; height: 14px; border-radius: 50%; background: #f3e8ff; border: 2px solid #12061f; cursor: pointer; }
+.chart-card:fullscreen input[type="range"]::-moz-range-thumb,
+.chart-card.is-fullscreen input[type="range"]::-moz-range-thumb { width: 10px; height: 10px; border-radius: 50%; background: #f3e8ff; border: 2px solid #12061f; cursor: pointer; }
+.chart-card:fullscreen .race-ticks,
+.chart-card.is-fullscreen .race-ticks { grid-area: ticks; margin: 0 1rem 0.4rem 0; color: rgba(201, 184, 224, 0.7); font-size: 0.65rem; }
+.fs-btn { display: inline-flex; align-items: center; justify-content: center; align-self: stretch; width: 2.6rem; min-height: 2.6rem; padding: 0; }
+
+/* Daily heatmap */
+.heat-summary { margin: -0.4rem 0 0.8rem; font-size: 0.85rem; color: var(--text-soft); }
+.heat-wrap { position: relative; }
+.heat-host { overflow-x: auto; padding-bottom: 0.3rem; }
+.heat-host svg { display: block; }
+.heat-year { fill: var(--text); font: 700 13px var(--font-body); }
+.heat-lbl { fill: var(--muted); font: 10px var(--font-body); }
+.heat-cell.in { cursor: pointer; }
+.heat-cell.in:hover { stroke: var(--text); stroke-width: 1.5; }
+.heat-legend { display: flex; flex-wrap: wrap; align-items: center; gap: 0.3rem; margin-top: 0.6rem; font-size: 0.75rem; color: var(--muted); }
+.heat-legend i { display: inline-block; width: 12px; height: 12px; border-radius: 2px; }
+.heat-legend span { margin-left: 0.4rem; }
+
+/* Taste river + period comparison */
+.river-wrap { position: relative; }
+.river-host { position: relative; width: 100%; height: clamp(320px, 40vw, 480px); overflow: hidden; border-radius: var(--radius); background: #12061f; }
+.river-host svg { display: block; }
+.river-layer { stroke: rgba(18, 6, 31, 0.5); stroke-width: 0.6; transition: opacity 0.15s; }
+.river-layer.dim { opacity: 0.3; }
+.river-label { fill: #fff; font-weight: 700; pointer-events: none; paint-order: stroke; stroke: rgba(18, 6, 31, 0.75); stroke-width: 3px; }
+.river-axis { fill: #c9b8e0; font: 11px var(--font-body); }
+.river-host .web-empty { color: #c9b8e0; }
+.cmp-dates { display: flex; flex-wrap: wrap; gap: 0.5rem 1.6rem; margin: 0.2rem 0 0.7rem; }
+.cmp-dates label { display: flex; align-items: center; gap: 0.4rem; font-size: 0.85rem; color: var(--text-soft); }
+.cmp-dates input { width: auto; }
+.cmp-dates i { display: inline-block; width: 0.7rem; height: 0.7rem; border-radius: 50%; }
+.cmp-a i { background: #38bdf8; }
+.cmp-b i { background: #fb923c; }
+.cmp-lists { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 0.4rem 1.6rem; margin-top: 0.8rem; }
+.cmp-lists h4 { margin: 0 0 0.3rem; font-family: var(--font-display); font-size: 1rem; color: var(--text); }
+.cmp-lists ul { margin: 0; padding: 0; list-style: none; font-size: 0.85rem; }
+.cmp-lists li { display: flex; flex-wrap: wrap; gap: 0.3rem; color: var(--text); }
+.cmp-lists li span { color: var(--muted); font-size: 0.78rem; }
+.cmp-lists .race-note { grid-column: 1 / -1; margin: 0; }
+.web-legend .map-grad { width: 180px; height: 10px; margin: 0 0.3rem; border-radius: 5px; vertical-align: middle; }
+.web-legend .map-legend-note { font-size: 0.72rem; opacity: 0.85; }
+/* Time slider painted with the recency colours */
+#map-scrub.colored { -webkit-appearance: none; appearance: none; height: 10px; border-radius: 5px; background: var(--track-bg); outline: none; }
+#map-scrub.colored::-webkit-slider-thumb { -webkit-appearance: none; width: 18px; height: 18px; border-radius: 50%; background: #fff; border: 3px solid #12061f; cursor: pointer; }
+#map-scrub.colored::-moz-range-thumb { width: 12px; height: 12px; border-radius: 50%; background: #fff; border: 3px solid #12061f; cursor: pointer; }
+#map-scrub.colored::-moz-range-track { background: transparent; }
+.anim-controls { flex-wrap: wrap; justify-content: flex-end; }
+.anim-controls button { white-space: nowrap; }
